@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Universal WebAR GPS Path v2.8 - HIGH SENSITIVITY</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <style>
+        body, html { margin: 0; padding: 0; overflow: hidden; width: 100%; height: 100%; font-family: sans-serif; background: #000; }
+        #camera-view { width: 100%; height: 100%; object-fit: cover; position: absolute; z-index: 1; }
+        #canvas3d { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 2; pointer-events: none; }
+        
+        /* Dashboard UI Glassmorphism */
+        #dashboard {
+            position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+            width: 88%; max-width: 420px; background: rgba(15, 23, 42, 0.85);
+            backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.15);
+            border-radius: 16px; padding: 16px; color: #f8fafc; z-index: 10;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+        }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 6px; }
+        .brand { font-weight: bold; color: #38bdf8; font-size: 13px; letter-spacing: 0.5px; }
+        .badge { background: #64748b; padding: 3px 8px; border-radius: 20px; font-size: 10px; font-weight: bold; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; font-size: 11px; color: #cbd5e1; }
+        .value { color: #f8fafc; font-weight: 600; }
+        
+        /* Buttons */
+        .btn-group { display: flex; gap: 8px; margin-top: 12px; }
+        .btn {
+            flex: 1; background: #38bdf8; color: #0f172a; border: none; padding: 8px 12px;
+            border-radius: 8px; font-weight: bold; font-size: 11px; cursor: pointer;
+            display: flex; align-items: center; justify-content: center; gap: 4px;
+        }
+        .btn:hover { background: #7dd3fc; }
+        .btn-secondary { background: rgba(255,255,255,0.15); color: #fff; }
+        .btn-secondary:hover { background: rgba(255,255,255,0.25); }
+        .instructions { background: rgba(251, 191, 36, 0.1); border: 1px solid rgba(251, 191, 36, 0.3); padding: 6px; border-radius: 6px; margin-top: 8px; color: #fbbf24; font-size: 10px; }
+        
+        /* Overlay Akses Sensor */
+        #sensor-overlay {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(9, 9, 11, 0.95); z-index: 100; display: flex;
+            flex-direction: column; align-items: center; justify-content: center; color: white; text-align: center; padding: 20px; box-sizing: border-box;
+        }
+        #sensor-overlay h2 { color: #38bdf8; margin-bottom: 10px; }
+        #sensor-overlay p { font-size: 14px; color: #a1a1aa; max-width: 300px; margin-bottom: 20px; }
+    </style>
+</head>
+<body>
+
+    <div id="sensor-overlay">
+        <h2>Aktivasi Pelacak Jalur AR</h2>
+        <p>Aplikasi memerlukan akses Kamera, GPS, dan Sensor Gerak HP agar garis AR dapat terkunci diam di tanah.</p>
+        <button class="btn" style="padding: 15px 30px; font-size: 14px; max-width: 250px;" id="btn-start-ar">MULAI SEKARANG</button>
+    </div>
+
+    <video id="camera-view" autoplay playsinline></video>
+    
+    <canvas id="canvas3d"></canvas>
+
+    <div id="dashboard">
+        <div class="header">
+            <span class="brand">🚀 UNIVERSAL TRAX-AR v2.8</span>
+            <span id="device-badge" class="badge">DETECTING...</span>
+        </div>
+        <div class="grid">
+            <div>GPS: <span id="ui-gps" class="value">Mencari...</span></div>
+            <div>Akurasi: <span id="ui-acc" class="value">-</span></div>
+            <div>Arah/Heading: <span id="ui-heading" class="value" style="color: #ef4444;">0° (Mencari...)</span></div>
+            <div>Total Titik: <span id="ui-points" class="value">0</span></div>
+        </div>
+        
+        <div id="laptop-guide" class="instructions" style="display:none;">
+            <strong>Simulasi Laptop Aktif:</strong> Gunakan keyboard <strong>W, A, S, D</strong> untuk berjalan virtual di layar webcam.
+        </div>
+
+        <div class="btn-group">
+            <button class="btn" id="btn-switch-cam">📷 SWITCH KAMERA</button>
+            <button class="btn btn-secondary" id="btn-calibrate">🔄 RESET POSISI</button>
+        </div>
+    </div>
+
+    <script>
+        // Endpoint REST API Server Backend Node.js
+        const BACKEND_URL = "http://localhost:3000/api/v1/path";
+
+        // State Global Aplikasi
+        let isLaptop = false;
+        let currentFacingMode = "environment"; 
+        let currentPos = { lat: -6.175392, lng: 106.827153, heading: 0 }; // Default Monas
+        let originPos = null;
+        let pathData = [];
+        let sirkulasiRotasi = new THREE.Quaternion(); // Mengunci rotasi 3D absolut
+
+        // Inisialisasi Grafis Three.js
+        const canvas = document.getElementById('canvas3d');
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ canvas: canvas, alpha: true, antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+
+        scene.add(new THREE.AmbientLight(0xffffff, 1));
+
+        // 1. ENGINE KAMERA UNIVERSAL (DEPAN/BELAKANG & WEBCAM)
+        async function startCamera(facingMode) {
+            const video = document.getElementById('camera-view');
+            if (video.srcObject) {
+                video.srcObject.getTracks().forEach(track => track.stop());
+            }
+
+            const constraints = {
+                audio: false,
+                video: {
+                    facingMode: isLaptop ? undefined : facingMode,
+                    width: { ideal: 1280 },
+                    height: { ideal: 720 }
+                }
+            };
+
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia(constraints);
+                video.srcObject = stream;
+                
+                if (facingMode === "user" && !isLaptop) {
+                    video.style.transform = "scaleX(-1)";
+                } else {
+                    video.style.transform = "scaleX(1)";
+                }
+            } catch (err) {
+                console.error("Gagal memuat kamera: ", err);
+                if(facingMode === "environment") startCamera("user");
+            }
+        }
+
+        // 2. MATRIKS KONVERSI GPS KE METRIC RUANG 3D METER
+        function convertGpsToVector(lat, lng) {
+            if (!originPos) return { x: 0, z: 0 };
+            const R = 6371000;
+            const dLat = (lat - originPos.lat) * Math.PI / 180;
+            const dLng = (lng - originPos.lng) * Math.PI / 180;
+            return {
+                x: dLng * Math.cos(originPos.lat * Math.PI / 180) * R,
+                z: -dLat * R
+            };
+        }
+
+        // 3. RENDER LINTASAN PIPA 3D NEON (STABLE FIX AT GROUND)
+        let lineMesh = null;
+        function update3DLine() {
+            if (pathData.length < 2) return;
+            if (lineMesh) scene.remove(lineMesh);
+
+            const points = [];
+            pathData.forEach(node => {
+                const localMatriks = convertGpsToVector(node.lat, node.lng);
+                // Dikunci di bawah tinggi lensa mata kamera (-1.4 meter)
+                points.push(new THREE.Vector3(localMatriks.x, -1.4, localMatriks.z));
+            });
+
+            const curve = new THREE.CatmullRomCurve3(points);
+            const geometry = new THREE.TubeGeometry(curve, pathData.length * 6, 0.15, 8, false);
+            const material = new THREE.MeshBasicMaterial({ color: 0x00ffcc, wireframe: false, transparent: true, opacity: 0.85 });
+            
+            lineMesh = new THREE.Mesh(geometry, material);
+            scene.add(lineMesh);
+            document.getElementById('ui-points').innerText = pathData.length;
+        }
+
+        // 4. DATABASE LINK & CACHE MANAGEMENT
+        async function sendToDatabase(lat, lng) {
+            const dataPoint = { lat, lng, time: Date.now() };
+            pathData.push(dataPoint);
+            update3DLine();
+
+            localStorage.setItem('backup_ar_track', JSON.stringify(pathData));
+
+            try {
+                await fetch(BACKEND_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(dataPoint)
+                });
+            } catch (e) {
+                console.log("Database offline. Menggunakan cache lokal browser.");
+            }
+        }
+
+        // 5. ENGINE SENSOR ORIENTASI MULTI-HANDLER (ANTI-STIKER SCREEN)
+        function aktifkanSensorKompas() {
+            window.addEventListener('deviceorientation', handleOrientationEngine, true);
+            window.addEventListener('deviceorientationabsolute', handleOrientationEngine, true);
+        }
+
+        function handleOrientationEngine(e) {
+            let alpha = e.alpha;
+            
+            if (e.webkitCompassHeading) {
+                alpha = -e.webkitCompassHeading;
+            }
+
+            if (alpha !== null && e.beta !== null && e.gamma !== null) {
+                const alphaRad = THREE.MathUtils.degToRad(alpha + (window.orientation || 0)); 
+                const betaRad = THREE.MathUtils.degToRad(e.beta);   
+                const gammaRad = THREE.MathUtils.degToRad(e.gamma); 
+
+                const euler = new THREE.Euler(betaRad, alphaRad, -gammaRad, 'YXZ');
+                sirkulasiRotasi.setFromEuler(euler);
+                
+                const uiHeading = document.getElementById('ui-heading');
+                uiHeading.innerText = Math.abs(Math.round(alpha)) + "° (AKTIF)";
+                uiHeading.style.color = "#22c55e"; 
+            }
+        }
+
+        // FIX: HIGH-SENSITIVITY GEOLOCATION ENGINE
+        function aktifkanSatelitGps() {
+            navigator.geolocation.watchPosition((position) => {
+                const { latitude, longitude, accuracy } = position.coords;
+                document.getElementById('ui-gps').innerText = `${latitude.toFixed(5)}, ${longitude.toFixed(5)}`;
+                document.getElementById('ui-acc').innerText = `±${accuracy.toFixed(1)}m`;
+
+                if (!originPos) originPos = { lat: latitude, lng: longitude };
+
+                // Bypass pengaman akurasi ditinggikan ke 150m agar jalan di dalam rumah
+                if (accuracy < 150) {
+                    if (pathData.length === 0) {
+                        sendToDatabase(latitude, longitude);
+                    } else {
+                        const lastNode = pathData[pathData.length - 1];
+                        const deltaMeter = Math.sqrt(Math.pow(latitude - lastNode.lat, 2) + Math.pow(longitude - lastNode.lng, 2)) * 111320;
+                        
+                        // Cukup melangkah sejauh 1 meter untuk langsung memicu garis baru
+                        if (deltaMeter >= 1.0) {
+                            sendToDatabase(latitude, longitude);
+                        }
+                    }
+                }
+            }, (err) => {
+                document.getElementById('ui-gps').innerText = "GPS Terblokir Browser";
+            }, { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 });
+        }
+
+        // 6. INITIALIZATION TRACKING SYSTEM
+        function initTrackingSystem() {
+            isLaptop = !(/Android|iPhone|iPad/i.test(navigator.userAgent));
+
+            if (isLaptop) {
+                document.getElementById('sensor-overlay').style.display = "none";
+                const badge = document.getElementById('device-badge');
+                badge.innerText = "LAPTOP SIMULATOR";
+                badge.style.background = "#a855f7";
+                document.getElementById('laptop-guide').style.display = "block";
+                document.getElementById('ui-acc').innerText = "PROXIMITY (OK)";
+                document.getElementById('ui-heading').innerText = "STATIC (LAPTOP)";
+                document.getElementById('ui-heading').style.color = "#38bdf8";
+
+                originPos = { lat: currentPos.lat, lng: currentPos.lng };
+                document.getElementById('ui-gps').innerText = `${currentPos.lat.toFixed(5)}, ${currentPos.lng.toFixed(5)}`;
+                sendToDatabase(currentPos.lat, currentPos.lng);
+
+                window.addEventListener('keydown', (e) => {
+                    const step = 0.00003; 
+                    if (e.key.toLowerCase() === 'w') currentPos.lat += step;
+                    if (e.key.toLowerCase() === 's') currentPos.lat -= step;
+                    if (e.key.toLowerCase() === 'a') currentPos.lng -= step;
+                    if (e.key.toLowerCase() === 'd') currentPos.lng += step;
+
+                    if (['w','a','s','d'].includes(e.key.toLowerCase())) {
+                        document.getElementById('ui-gps').innerText = `${currentPos.lat.toFixed(5)}, ${currentPos.lng.toFixed(5)}`;
+                        sendToDatabase(currentPos.lat, currentPos.lng);
+                    }
+                });
+                
+                startCamera(currentFacingMode);
+            } else {
+                document.getElementById('device-badge').innerText = "MOBILE MULTI-CAM";
+                document.getElementById('device-badge').style.background = "#10b981";
+                
+                document.getElementById('btn-start-ar').addEventListener('click', () => {
+                    document.getElementById('sensor-overlay').style.display = "none";
+                    
+                    if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+                        DeviceOrientationEvent.requestPermission()
+                            .then(permissionState => {
+                                if (permissionState === 'granted') { aktifkanSensorKompas(); }
+                            }).catch(console.error);
+                    } else {
+                        aktifkanSensorKompas(); 
+                    }
+                    
+                    aktifkanSatelitGps();
+                    startCamera(currentFacingMode);
+                });
+            }
+        }
+
+        // 7. CONTROLLER HANDLERS
+        document.getElementById('btn-switch-cam').addEventListener('click', () => {
+            if (isLaptop) {
+                alert("Laptop hanya memiliki satu kamera internal default.");
+                return;
+            }
+            currentFacingMode = (currentFacingMode === "environment") ? "user" : "environment";
+            startCamera(currentFacingMode);
+        });
+
+        document.getElementById('btn-calibrate').addEventListener('click', () => {
+            if (pathData.length > 0) {
+                const latest = pathData[pathData.length - 1];
+                originPos = { lat: latest.lat, lng: latest.lng };
+                update3DLine();
+                alert("Jalur dikalibrasi ulang tepat di bawah posisi kaki Anda.");
+            }
+        });
+
+        function playRenderLoop() {
+            requestAnimationFrame(playRenderLoop);
+            if (!isLaptop) {
+                camera.quaternion.copy(sirkulasiRotasi);
+            } else {
+                camera.lookAt(0, -1.4, -5);
+            }
+            renderer.render(scene, camera);
+        }
+
+        window.onload = () => {
+            initTrackingSystem();
+            playRenderLoop();
+
+            const cacheData = localStorage.getItem('backup_ar_track');
+            if (cacheData) {
+                pathData = JSON.parse(cacheData);
+                if (!originPos && pathData.length > 0) originPos = { lat: pathData[0].lat, lng: pathData[0].lng };
+                update3DLine();
+            }
+        };
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
